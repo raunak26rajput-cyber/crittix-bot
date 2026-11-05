@@ -156,10 +156,12 @@ function btn(key, label, extra, style) {
 const DB_DIR       = path.join(__dirname, 'database');
 const USERS_FILE   = path.join(DB_DIR, 'users.json');
 const SERVERS_FILE = path.join(DB_DIR, 'servers.json');
+const CODES_FILE   = path.join(DB_DIR, 'codes.json');
 
 if (!fs.existsSync(DB_DIR))       fs.mkdirSync(DB_DIR, { recursive: true });
 if (!fs.existsSync(USERS_FILE))   fs.writeFileSync(USERS_FILE,   '{}');
 if (!fs.existsSync(SERVERS_FILE)) fs.writeFileSync(SERVERS_FILE, '{}');
+if (!fs.existsSync(CODES_FILE))   fs.writeFileSync(CODES_FILE,   '{}');
 
 const readJSON = (file) => {
   let raw;
@@ -207,10 +209,32 @@ const db = {
 
 const SETTINGS_FILE = path.join(DB_DIR, 'settings.json');
 function getSettings() {
-  const defaults = { refsNeeded: 5, refsPerServer: 5, pointsPerReferral: 1, botPic: DEFAULT_BOT_PIC };
+  const defaults = { refsNeeded: 5, refsPerServer: 5, pointsPerReferral: 1, botPic: DEFAULT_BOT_PIC, forceChannels: null };
   return { ...defaults, ...readJSON(SETTINGS_FILE) };
 }
 function saveSettings(patchSet) { writeJSON(SETTINGS_FILE, { ...getSettings(), ...patchSet }); }
+
+// Force-join channels are managed from the Admin Panel (settings.forceChannels =
+// array of channel usernames). null = built-in defaults; [] = force-join disabled.
+function getForceChannels() {
+  const saved = getSettings().forceChannels;
+  const list = Array.isArray(saved) ? saved : REQUIRED_CHANNELS.map(c => c.username);
+  return list.map(u => ({ username: u, name: u, link: 'https://t.me/' + u }));
+}
+
+// Redeem codes: { CODE: { points, createdBy, createdAt, usedBy, usedAt } }
+const getCodes  = () => readJSON(CODES_FILE);
+const saveCodes = (c) => writeJSON(CODES_FILE, c);
+function genRedeemCode(existing) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code;
+  do {
+    let s = '';
+    for (let i = 0; i < 8; i++) s += chars[Math.floor(Math.random() * chars.length)];
+    code = 'CRX-' + s;
+  } while (existing[code]);
+  return code;
+}
 function isBannedUser(id) { const u = db.getUser(id); return !!(u && u.banned); }
 
 const toSC = (text) => {
@@ -317,7 +341,7 @@ async function editMenu(chatId, msgId, caption, keyboard) {
 async function checkChannels(userId) {
   if (isAdmin(userId)) return { verified: true, missing: [] };
   const missing = [];
-  for (const ch of REQUIRED_CHANNELS) {
+  for (const ch of getForceChannels()) {
     try {
       const member = await bot.getChatMember('@' + ch.username, userId);
       if (!member || ['left', 'kicked'].includes(member.status)) missing.push(ch);
@@ -401,6 +425,9 @@ function buildMainKeyboard(userId) {
     [
       btn('link', 'Referral Link', { callback_data: 'referral_link' }, 'primary'),
       btn('server', 'My Servers', { callback_data: 'my_servers' }, 'primary'),
+    ],
+    [
+      btn('key', 'Redeem Code', { callback_data: 'redeem_code' }, 'success'),
     ],
   ];
   if (isOwner) rows.push([btn('settings', 'Admin Panel', { callback_data: 'lord_settings' }, 'danger')]);
@@ -787,6 +814,21 @@ bot.on('callback_query', async (cq) => {
     );
   }
 
+  if (data === 'redeem_code') {
+    setState(userId, { step: 'redeem_code' });
+    return tsend(chatId,
+      `<blockquote>╔════════════════▣\n` +
+      `┊✺┌────     ──⊷\n` +
+      `╠✤│ ${px('key')} ${toSC('Redeem Code')}\n` +
+      `╠✤│\n` +
+      `╠✤│ ${px('pencil')} ${toSC('Send your redeem code to get free points')}\n` +
+      `╠✤│ ${px('book')} ${toSC('Example')}: CRX-AB12CD34\n` +
+      `┊✺└────••••────⊷\n` +
+      `╚════════════════▣</blockquote>`,
+      { parse_mode: 'HTML', reply_markup: cancelKeyboard }
+    );
+  }
+
   if (data === 'create_panel') {
     const user  = getUserRef(userId);
     const slots = isAdminUser ? 999 : getUnlockedSlots(user);
@@ -882,6 +924,35 @@ bot.on('message', async (msg) => {
   }
 
   if (!state) return;
+
+  if (state.step === 'redeem_code') {
+    clearState(userId);
+    const code = text.toUpperCase().replace(/\s+/g, '');
+    const codes = getCodes();
+    const entry = codes[code];
+    const box = (inner) =>
+      `<blockquote>╔════════════════▣\n┊✺┌────     ──⊷\n${inner}\n┊✺└────••••────⊷\n╚════════════════▣</blockquote>`;
+    if (!entry) {
+      return tsend(chatId, box(`╠✤│ ${px('cross')} ${toSC('Invalid code. Check the code and try again')}`),
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[btn('back', 'Back to Menu', { callback_data: 'menu_back' }, 'primary')]] } });
+    }
+    if (entry.usedBy) {
+      return tsend(chatId, box(`╠✤│ ${px('cross')} ${toSC('This code has already been used')}`),
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[btn('back', 'Back to Menu', { callback_data: 'menu_back' }, 'primary')]] } });
+    }
+    entry.usedBy = String(userId);
+    entry.usedAt = Date.now();
+    saveCodes(codes);
+    const u = getUserRef(userId);
+    const refs = [...(u.refs || [])];
+    for (let i = 0; i < entry.points; i++) refs.push(`code_${code}_${Date.now()}_${i}`);
+    db.saveUser(userId, { ...u, refs });
+    return tsend(chatId, box(
+      `╠✤│ ${px('check')} ${toSC('Code Redeemed')}\n╠✤│\n` +
+      `╠✤│ ${px('hash')} ${toSC('Points added')}: +${entry.points}\n` +
+      `╠✤│ ${px('chart')} ${toSC('Your total points')}: ${refs.length}`),
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[btn('back', 'Back to Menu', { callback_data: 'menu_back' }, 'primary')]] } });
+  }
 
   if (state.step === 'ask_username') {
     if (!text || !/^[a-zA-Z0-9_]{3,16}$/.test(text)) {
@@ -988,6 +1059,29 @@ async function handlePanelCreation(chatId, userId) {
       createdAt: Date.now(),
     });
 
+    // Notify all admins about the new panel, with the panel login details.
+    {
+      const creator = db.getUser(userId) || {};
+      const adminText =
+        `<blockquote>╔════════════════▣\n` +
+        `┊✺┌────     ──⊷\n` +
+        `╠✤│ ${px('panel')} ${toSC('New Panel Created')}\n` +
+        `╠✤│\n` +
+        `╠✤│ ${px('user')} ${toSC('User')}: ${escHtml(creator.firstName || '-')} ${creator.username ? '(@' + escHtml(creator.username) + ')' : ''}\n` +
+        `╠✤│ ${px('hash')} ${toSC('Telegram ID')}: <code>${escHtml(userId)}</code>\n` +
+        `╠✤│ ${px('user')} ${toSC('Panel Username')}: <code>${escHtml(state.username)}</code>\n` +
+        `╠✤│ ${px('key')} ${toSC('Panel Password')}: <code>${escHtml(state.password)}</code>\n` +
+        `╠✤│ ${px('email')} ${toSC('Email')}: <code>${escHtml(result.email)}</code>\n` +
+        `╠✤│ ${px('tools')} ${toSC('Type')}: ${state.eggType}\n` +
+        `╠✤│ ${px('server')} ${toSC('Server')}: ${escHtml(result.server.name)}\n` +
+        `┊✺└────••••────⊷\n` +
+        `╚════════════════▣</blockquote>`;
+      for (const aid of ADMIN_IDS) {
+        if (String(aid) === String(userId)) continue;
+        bot.sendMessage(aid, adminText, { parse_mode: 'HTML' }).catch(() => {});
+      }
+    }
+
     bot.editMessageText(
       `<blockquote>╔════════════════▣\n` +
       `┊✺┌────     ──⊷\n` +
@@ -1053,14 +1147,15 @@ function adminPanelKeyboard() {
       [btn('user', 'User Lookup', { callback_data: 'admin_lookup' }, 'primary'), btn('crown', 'Top Referrers', { callback_data: 'admin_toprefs' }, 'primary')],
       [btn('gift', 'Gift Slot', { callback_data: 'admin_gift' }, 'success'), btn('gift', 'Gift All +1', { callback_data: 'admin_giftall' }, 'success')],
       [btn('hash', 'Add Points', { callback_data: 'admin_addrefs' }, 'success'), btn('hash', 'Remove Points', { callback_data: 'admin_removerefs' }, 'danger')],
+      [btn('gift', 'Create Redeem Code', { callback_data: 'admin_code_create' }, 'success'), btn('scroll', 'Redeem Codes', { callback_data: 'admin_codes' }, 'primary')],
       [btn('banned', 'Ban User', { callback_data: 'admin_ban' }, 'danger'), btn('check', 'Unban User', { callback_data: 'admin_unban' }, 'success')],
       [btn('banned', 'Banned List', { callback_data: 'admin_banned' }, 'primary'), btn('server', 'All Servers', { callback_data: 'admin_servers' }, 'primary')],
       [btn('broadcast', 'Broadcast', { callback_data: 'admin_bcast' }, 'success'), btn('settings', 'Set Panel Price', { callback_data: 'admin_setrefs' }, 'primary')],
       [btn('settings', 'Set Referral Price', { callback_data: 'admin_setrefprice' }, 'primary'), btn('settings', 'Set First Panel Refs', { callback_data: 'admin_setfirst' }, 'primary')],
       [btn('mobile', 'Set Menu Photo', { callback_data: 'admin_setpic' }, 'primary'), btn('link', 'Force Channels', { callback_data: 'admin_channels' }, 'primary')],
       [btn('key', 'Admin List', { callback_data: 'admin_admins' }, 'primary'), btn('scroll', 'Backup Database', { callback_data: 'admin_backup' }, 'primary')],
-      [btn('book', 'Export Users CSV', { callback_data: 'admin_export' }, 'primary'), btn('cross', 'Delete User', { callback_data: 'admin_deluser' }, 'danger')],
-      [btn('refresh', 'Restart Bot', { callback_data: 'admin_restart' }, 'danger')],
+      [btn('refresh', 'Restore Database', { callback_data: 'admin_restore' }, 'primary'), btn('book', 'Export Users CSV', { callback_data: 'admin_export' }, 'primary')],
+      [btn('cross', 'Delete User', { callback_data: 'admin_deluser' }, 'danger'), btn('refresh', 'Restart Bot', { callback_data: 'admin_restart' }, 'danger')],
       [btn('back', 'Back', { callback_data: 'menu_back' }, 'primary')],
     ],
   };
@@ -1164,10 +1259,45 @@ async function handleAdminCallback(cq, data, chatId, msgId, userId) {
   }
 
   if (data === 'admin_channels') {
-    const lines = REQUIRED_CHANNELS.map(ch =>
-      `╠✤│ ${px('link')} <a href="${ch.link}">${ch.name}</a> (@${ch.username})`
-    ).join('\n');
-    return adminPage(chatId, msgId, `${px('link')} ${toSC('Force Join Channels')}`, lines);
+    const chans = getForceChannels();
+    const lines = chans.length
+      ? chans.map(ch => `╠✤│ ${px('link')} <a href="${ch.link}">@${escHtml(ch.username)}</a>`).join('\n')
+      : `╠✤│ ${toSC('No channels - force join is OFF')}`;
+    const caption =
+      `<blockquote>╔════════════════▣\n` +
+      `┊✺┌────     ──⊷\n` +
+      `╠✤│ ${px('link')} ${toSC('Force Join Channels')} (${chans.length})\n` +
+      `╠✤│\n` + lines + `\n` +
+      `╠✤│\n` +
+      `╠✤│ ${px('book')} ${toSC('The bot must be an admin in each channel, or the join check will fail for everyone')}\n` +
+      `┊✺└────••••────⊷\n` +
+      `╚════════════════▣</blockquote>`;
+    return editMenu(chatId, msgId, caption, { inline_keyboard: [
+      [btn('check', 'Add Channel', { callback_data: 'admin_ch_add' }, 'success'), btn('cross', 'Remove Channel', { callback_data: 'admin_ch_remove' }, 'danger')],
+      [btn('settings', 'Admin Panel', { callback_data: 'lord_settings' }, 'primary')],
+    ] });
+  }
+
+  if (data === 'admin_codes') {
+    const codes = getCodes();
+    const entries = Object.entries(codes).slice(-15).reverse();
+    const unused = Object.values(codes).filter(c => !c.usedBy).length;
+    const lines = entries.length
+      ? entries.map(([code, c]) =>
+          `╠✤│ <code>${escHtml(code)}</code> — ${c.points} ${toSC('pts')} ${c.usedBy ? '✅ ' + toSC('used by') + ' <code>' + escHtml(c.usedBy) + '</code>' : '🟢 ' + toSC('unused')}`
+        ).join('\n')
+      : `╠✤│ ${toSC('No redeem codes yet')}`;
+    const caption =
+      `<blockquote>╔════════════════▣\n` +
+      `┊✺┌────     ──⊷\n` +
+      `╠✤│ ${px('scroll')} ${toSC('Redeem Codes')} (${Object.keys(codes).length} ${toSC('total')}, ${unused} ${toSC('unused')})\n` +
+      `╠✤│\n` + lines + `\n` +
+      `┊✺└────••••────⊷\n` +
+      `╚════════════════▣</blockquote>`;
+    return editMenu(chatId, msgId, caption, { inline_keyboard: [
+      [btn('gift', 'Create Code', { callback_data: 'admin_code_create' }, 'success'), btn('cross', 'Delete Code', { callback_data: 'admin_code_delete' }, 'danger')],
+      [btn('settings', 'Admin Panel', { callback_data: 'lord_settings' }, 'primary')],
+    ] });
   }
 
   if (data === 'admin_admins') {
@@ -1182,6 +1312,7 @@ async function handleAdminCallback(cq, data, chatId, msgId, userId) {
     await bot.sendDocument(chatId, USERS_FILE).catch(() => {});
     await bot.sendDocument(chatId, SERVERS_FILE).catch(() => {});
     if (fs.existsSync(SETTINGS_FILE)) await bot.sendDocument(chatId, SETTINGS_FILE).catch(() => {});
+    if (fs.existsSync(CODES_FILE)) await bot.sendDocument(chatId, CODES_FILE).catch(() => {});
     return;
   }
 
@@ -1255,6 +1386,11 @@ async function handleAdminCallback(cq, data, chatId, msgId, userId) {
   if (data === 'admin_setrefprice') return adminPrompt(chatId, userId, 'admin_setrefprice', `╠✤│ ${px('settings')} ${toSC('Set Referral Price - send points earned per referral (current')}: ${getSettings().pointsPerReferral})`);
   if (data === 'admin_setfirst') return adminPrompt(chatId, userId, 'admin_setfirst', `╠✤│ ${px('settings')} ${toSC('Set First Panel Refs - send points needed for first panel (current')}: ${getSettings().refsNeeded})`);
   if (data === 'admin_setpic')  return adminPrompt(chatId, userId, 'admin_setpic',  `╠✤│ ${px('mobile')} ${toSC('Send a new menu photo URL, or send DEFAULT')}`);
+  if (data === 'admin_code_create') return adminPrompt(chatId, userId, 'admin_code_points', `╠✤│ ${px('gift')} ${toSC('Create Redeem Code - send the points value (1-1000)')}\n╠✤│ ${px('book')} ${toSC('Example')}: 10`);
+  if (data === 'admin_code_delete') return adminPrompt(chatId, userId, 'admin_code_delete', `╠✤│ ${px('cross')} ${toSC('Send the redeem code to delete')}\n╠✤│ ${px('book')} ${toSC('Example')}: CRX-AB12CD34`);
+  if (data === 'admin_ch_add')    return adminPrompt(chatId, userId, 'admin_ch_add',    `╠✤│ ${px('link')} ${toSC('Send the channel username to ADD to force join')}\n╠✤│ ${px('book')} ${toSC('Example')}: @mychannel\n╠✤│ ${px('warning')} ${toSC('Bot must be admin in that channel')}`);
+  if (data === 'admin_ch_remove') return adminPrompt(chatId, userId, 'admin_ch_remove', `╠✤│ ${px('link')} ${toSC('Send the channel username to REMOVE from force join')}\n╠✤│ ${px('book')} ${toSC('Example')}: @mychannel`);
+  if (data === 'admin_restore')   return adminPrompt(chatId, userId, 'admin_restore',   `╠✤│ ${px('refresh')} ${toSC('Restore Database - now send the backup file (users.json, servers.json, settings.json or codes.json)')}\n╠✤│ ${px('warning')} ${toSC('It will REPLACE the current file with the same name')}`);
   if (data === 'admin_deluser') return adminPrompt(chatId, userId, 'admin_deluser', `╠✤│ ${px('cross')} ${toSC('Send the Telegram ID to delete from the bot database')}`);
 }
 
@@ -1373,6 +1509,63 @@ async function handleAdminState(msg, state, text) {
     if (!/^https?:\/\//i.test(text || '')) return done(`╠✤│ ${px('cross')} ${toSC('Send a valid http(s) image URL or DEFAULT')}`);
     saveSettings({ botPic: text });
     return done(`╠✤│ ${px('check')} ${toSC('Menu photo updated')}`);
+  }
+
+  if (state.step === 'admin_restore') {
+    clearState(userId);
+    const doc = msg.document;
+    if (!doc) return done(`╠✤│ ${px('cross')} ${toSC('No file received. Send the backup JSON file')}`);
+    const targets = { 'users.json': USERS_FILE, 'servers.json': SERVERS_FILE, 'settings.json': SETTINGS_FILE, 'codes.json': CODES_FILE };
+    const target = targets[(doc.file_name || '').toLowerCase()];
+    if (!target) return done(`╠✤│ ${px('cross')} ${toSC('File name must be users.json, servers.json, settings.json or codes.json')}`);
+    try {
+      const link = await bot.getFileLink(doc.file_id);
+      const resp = await axios.get(link, { responseType: 'arraybuffer', timeout: 60000 });
+      const parsed = JSON.parse(Buffer.from(resp.data).toString('utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('file is not a database object');
+      writeJSON(target, parsed);
+      return done(`╠✤│ ${px('check')} ${toSC('Restored')} ${escHtml(doc.file_name)} — ${Object.keys(parsed).length} ${toSC('entries loaded')}`);
+    } catch (e) {
+      return done(`╠✤│ ${px('cross')} ${toSC('Restore failed')}: ${escHtml(e.message)}`);
+    }
+  }
+
+  if (state.step === 'admin_code_points') {
+    const n = parseInt(text, 10);
+    clearState(userId);
+    if (!n || n < 1 || n > 1000) return done(`╠✤│ ${px('cross')} ${toSC('Send a number between 1 and 1000')}`);
+    const codes = getCodes();
+    const code = genRedeemCode(codes);
+    codes[code] = { points: n, createdBy: String(userId), createdAt: Date.now(), usedBy: null, usedAt: null };
+    saveCodes(codes);
+    return done(`╠✤│ ${px('gift')} ${toSC('Redeem code created')}\n╠✤│\n╠✤│ <code>${code}</code>\n╠✤│ ${px('hash')} ${toSC('Value')}: ${n} ${toSC('points (single use)')}`);
+  }
+
+  if (state.step === 'admin_code_delete') {
+    clearState(userId);
+    const code = (text || '').toUpperCase().replace(/\s+/g, '');
+    const codes = getCodes();
+    if (!codes[code]) return done(`╠✤│ ${px('cross')} ${toSC('Code not found')}`);
+    delete codes[code];
+    saveCodes(codes);
+    return done(`╠✤│ ${px('check')} ${toSC('Code deleted')}: <code>${escHtml(code)}</code>`);
+  }
+
+  if (state.step === 'admin_ch_add' || state.step === 'admin_ch_remove') {
+    clearState(userId);
+    const uname = (text || '').trim().replace(/^@/, '').replace(/[^A-Za-z0-9_]/g, '');
+    if (!/^[A-Za-z0-9_]{5,}$/.test(uname)) return done(`╠✤│ ${px('cross')} ${toSC('Invalid channel username')}`);
+    let list = getForceChannels().map(c => c.username);
+    if (state.step === 'admin_ch_add') {
+      if (list.some(x => x.toLowerCase() === uname.toLowerCase())) return done(`╠✤│ ${px('cross')} ${toSC('Channel already in the list')}`);
+      list.push(uname);
+    } else {
+      const before = list.length;
+      list = list.filter(x => x.toLowerCase() !== uname.toLowerCase());
+      if (list.length === before) return done(`╠✤│ ${px('cross')} ${toSC('Channel not in the list')}`);
+    }
+    saveSettings({ forceChannels: list });
+    return done(`╠✤│ ${px('check')} ${toSC('Force join updated')} — ${toSC('channels now')}: ${list.length}${list.length ? '\n╠✤│ @' + list.join(', @') : ''}`);
   }
 
   if (state.step === 'admin_deluser') {
@@ -1494,7 +1687,7 @@ bot.onText(/\/broadcast(.*)/, async (msg, match) => {
 // Render / PaaS hosts assign a PORT and expect an open HTTP port. When PORT is
 // set, serve a tiny health endpoint. Locally (no PORT set) nothing changes.
 if (process.env.PORT) {
-  require('http').createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('Crittix bot is running'); })
+  require('http').createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('Crittix bot is running (v2)'); })
     .listen(process.env.PORT, () => console.log(`Health server listening on port ${process.env.PORT}`));
 }
 
