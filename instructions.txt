@@ -1,0 +1,4 @@
+This file was created by Devine modify and use for your panel bot if you don't understand anything about it send to any smart AI so they'll help you out or you can meet me directly to guide you @heis_devine this bot only uses two file which are indexjs and package.json everything here is provided as is for an open source project. 
+YOU MIGHT NOT UNDERSTAND HOW I WRITE MY FILE SO I ADVISE YOU TO READ THE FILE PROPERLY BEFORE MODIFY CUZ ONE LITTLE ERROR WILL CRASH THE WHOLE FILE.
+inside the Eggs folder is the two eggs that was used in this bot development so it's either you use those eggs on your pterodactyl or you modify the file to work with the eggs on your pterodactyl. 
+YOU MUST HAVE YOUR OWN ADMIN PANEL. 
